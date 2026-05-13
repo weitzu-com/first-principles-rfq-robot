@@ -153,19 +153,6 @@ def discover_suppliers(state: RFQState) -> RFQState:
         )
     )
     candidates = tavily_search(query)
-    if not candidates:
-        candidates = [
-            {
-                "name": "Local precision manufacturing partner",
-                "website": "precision-manufacturing.example",
-                "snippet": "Fallback candidate for CNC, fabrication, and prototype RFQs.",
-            },
-            {
-                "name": "Rapid prototype supplier",
-                "website": "rapid-prototype.example",
-                "snippet": "Fallback candidate for quick-turn engineering samples.",
-            },
-        ]
     return {"candidate_suppliers": candidates[:5]}
 
 
