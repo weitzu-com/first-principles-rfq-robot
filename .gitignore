@@ -1,0 +1,29 @@
+# Secrets — real values never committed; .env.example is the template
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials*
+
+# Supplier / RFQ working data & outputs (may contain real contacts / quotes / prices)
+/output/
+/outputs/
+/results/
+/data/
+/suppliers/
+*.local.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
