@@ -1,0 +1,214 @@
+import os
+import subprocess
+import sys
+import unittest
+from unittest.mock import Mock, patch
+
+import app
+
+
+class RFQWorkflowTests(unittest.TestCase):
+    def test_import_succeeds_without_api_keys(self):
+        env = os.environ.copy()
+        env.pop("XAI_API_KEY", None)
+        env.pop("TAVILY_API_KEY", None)
+
+        result = subprocess.run(
+            [sys.executable, "-c", "import app; print(app.get_llm())"],
+            check=True,
+            capture_output=True,
+            env=env,
+            text=True,
+        )
+
+        self.assertIn("None", result.stdout)
+
+    def test_workflow_handles_missing_discovery_services(self):
+        with patch.dict(os.environ, {"XAI_API_KEY": "", "TAVILY_API_KEY": ""}, clear=False):
+            app.get_llm.cache_clear()
+            with patch("app._invoke_llm", return_value=""):
+                result = app.run_workflow(
+                    "6061 aluminum CNC bracket, +/-0.05 mm tolerance, 100 prototype units"
+                )
+
+        self.assertIn("physical_requirements", result)
+        self.assertEqual(result["candidate_suppliers"], [])
+        self.assertEqual(result["qualified_suppliers"], [])
+        self.assertEqual(result["rfq_results"], [])
+        self.assertIn("No qualified supplier contacts", result["final_recommendation"])
+
+    def test_workflow_drafts_rfq_for_discovered_supplier(self):
+        supplier = {
+            "name": "Acme CNC",
+            "website": "https://www.acme-cnc.example",
+            "snippet": "Manufacturer offering CNC machining and prototype fabrication.",
+        }
+        with patch.dict(os.environ, {"XAI_API_KEY": "", "TAVILY_API_KEY": ""}, clear=False):
+            app.get_llm.cache_clear()
+            with patch("app._invoke_llm", return_value=""), patch("app.tavily_search", return_value=[supplier]):
+                result = app.run_workflow(
+                    "6061 aluminum CNC bracket, +/-0.05 mm tolerance, 100 prototype units"
+                )
+
+        self.assertGreaterEqual(len(result["qualified_suppliers"]), 1)
+        self.assertGreaterEqual(len(result["rfq_results"]), 1)
+        self.assertIn("Start with", result["final_recommendation"])
+
+    def test_in_house_decision_skips_supplier_outreach(self):
+        llm_responses = [
+            "",
+            '{"make_in_house": true, "reason": "Use the qualified internal cell."}',
+        ]
+        with patch.dict(os.environ, {"XAI_API_KEY": "", "TAVILY_API_KEY": ""}, clear=False):
+            app.get_llm.cache_clear()
+            with patch("app._invoke_llm", side_effect=llm_responses), patch("app.tavily_search") as search:
+                result = app.run_workflow("Build this prototype in-house on our CNC mill.")
+
+        search.assert_not_called()
+        self.assertTrue(result["in_house_decision"])
+        self.assertEqual(result["candidate_suppliers"], [])
+        self.assertEqual(result["rfq_results"], [])
+        self.assertIn("Build in-house", result["final_recommendation"])
+
+    def test_blank_part_specs_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "Part specifications are required"):
+            app.run_workflow("   ")
+
+    def test_domain_extraction_handles_plain_and_full_urls(self):
+        self.assertEqual(app._domain_from_website("https://www.example.com/path"), "example.com")
+        self.assertEqual(app._domain_from_website("supplier.example"), "supplier.example")
+        self.assertEqual(app._domain_from_website(""), "")
+        self.assertEqual(app.snov_find_contact("")["email"], "")
+
+    def test_string_false_does_not_skip_supplier_rfq(self):
+        supplier = {
+            "name": "Acme CNC",
+            "website": "https://www.acme-cnc.example",
+            "snippet": "Manufacturer offering CNC machining and prototype fabrication.",
+        }
+        llm_responses = [
+            "",
+            '{"make_in_house": "false", "reason": "No internal capacity."}',
+        ]
+        with patch.dict(os.environ, {"XAI_API_KEY": "", "TAVILY_API_KEY": ""}, clear=False):
+            app.get_llm.cache_clear()
+            with patch("app._invoke_llm", side_effect=llm_responses), patch(
+                "app.tavily_search", return_value=[supplier]
+            ):
+                result = app.run_workflow("6061 aluminum CNC bracket, 50 units")
+
+        self.assertFalse(result["in_house_decision"])
+        self.assertGreaterEqual(len(result["rfq_results"]), 1)
+        self.assertIn("Start with", result["final_recommendation"])
+
+    def test_null_requirement_lists_do_not_crash_discovery(self):
+        supplier = {
+            "name": "Acme CNC",
+            "website": "https://www.acme-cnc.example",
+            "snippet": "Manufacturer offering CNC machining.",
+        }
+        llm_responses = [
+            '{"summary": "bracket", "materials": null, "processes": null, "quality_requirements": null, "volume": null}',
+            '{"make_in_house": false, "reason": "Outsource."}',
+        ]
+        with patch.dict(os.environ, {"XAI_API_KEY": "", "TAVILY_API_KEY": ""}, clear=False):
+            app.get_llm.cache_clear()
+            with patch("app._invoke_llm", side_effect=llm_responses), patch(
+                "app.tavily_search", return_value=[supplier]
+            ) as search:
+                result = app.run_workflow("CNC bracket")
+
+        search.assert_called_once()
+        self.assertGreaterEqual(len(result["rfq_results"]), 1)
+
+    def test_rfq_draft_keeps_full_part_specs(self):
+        long_specs = (
+            "6061-T6 aluminum CNC optical bench bracket with +/-0.01 mm true position "
+            "on datum A, hard-anodize Type III, serialized CMM report, "
+            + ("detailed inspection note " * 80)
+            + "and 250 prototype units due in 4 weeks."
+        )
+        self.assertGreater(len(long_specs), 1000)
+        supplier = {
+            "name": "Acme CNC",
+            "website": "https://www.acme-cnc.example",
+            "snippet": "Manufacturer offering CNC machining and prototype fabrication.",
+        }
+        with patch.dict(os.environ, {"XAI_API_KEY": "", "TAVILY_API_KEY": ""}, clear=False):
+            app.get_llm.cache_clear()
+            with patch("app._invoke_llm", return_value=""), patch("app.tavily_search", return_value=[supplier]):
+                result = app.run_workflow(long_specs)
+
+        self.assertIn(long_specs, result["rfq_results"][0]["draft_message"])
+        self.assertEqual(result["physical_requirements"]["summary"], long_specs)
+
+    def test_boolean_and_list_coercion_helpers(self):
+        self.assertFalse(app._as_bool("false"))
+        self.assertFalse(app._as_bool("0"))
+        self.assertTrue(app._as_bool("true"))
+        self.assertTrue(app._as_bool(True))
+        self.assertEqual(app._as_str_list(None), [])
+        self.assertEqual(app._as_str_list("aluminum"), ["aluminum"])
+        self.assertEqual(app._as_str_list(["cnc", None, "welding"]), ["cnc", "welding"])
+
+    def test_llm_invoke_failure_falls_back_instead_of_crashing(self):
+        fake_llm = Mock()
+        fake_llm.invoke.side_effect = RuntimeError("model grok-beta does not exist")
+
+        with patch.dict(os.environ, {"XAI_API_KEY": "sk-test-invalid", "TAVILY_API_KEY": ""}, clear=False):
+            app.get_llm.cache_clear()
+            with patch("app.get_llm", return_value=fake_llm):
+                result = app.run_workflow("6061 aluminum CNC bracket, 50 prototype units")
+
+        self.assertIn("physical_requirements", result)
+        self.assertEqual(result["candidate_suppliers"], [])
+        self.assertEqual(result["rfq_results"], [])
+        self.assertIn("No qualified supplier contacts", result["final_recommendation"])
+        self.assertGreaterEqual(fake_llm.invoke.call_count, 1)
+
+    def test_persist_workflow_result_replaces_stale_drafts(self):
+        session_state = {
+            "rfq_draft_0": "old aluminum bracket email",
+            "rfq_draft_1": "old backup email",
+            "unrelated": "keep-me",
+        }
+        new_result = {
+            "final_recommendation": "Start with Acme CNC and keep 0 backup supplier(s) in parallel.",
+            "rfq_results": [
+                {
+                    "supplier": "Acme CNC",
+                    "email": "tech@acme.example",
+                    "draft_message": "new titanium implant email",
+                }
+            ],
+        }
+
+        app.persist_workflow_result(session_state, new_result)
+
+        self.assertEqual(session_state[app.WORKFLOW_RESULT_KEY], new_result)
+        self.assertNotIn("rfq_draft_0", session_state)
+        self.assertNotIn("rfq_draft_1", session_state)
+        self.assertEqual(session_state["unrelated"], "keep-me")
+
+    def test_ui_keeps_results_after_rerun(self):
+        from pathlib import Path
+        from streamlit.testing.v1 import AppTest
+
+        app_path = Path(__file__).resolve().parents[1] / "app.py"
+        at = AppTest.from_file(str(app_path), default_timeout=15)
+        at.run()
+        self.assertFalse(at.exception)
+
+        at.text_area[0].set_value("6061 aluminum CNC bracket, 50 prototype units").run()
+        at.button[0].click().run()
+        self.assertFalse(at.exception)
+        self.assertTrue(any("No qualified supplier contacts" in str(item.value) for item in at.success))
+
+        # A later rerun (editing the spec box, not clicking Run) used to drop results.
+        at.text_area[0].set_value("6061 aluminum CNC bracket, 50 prototype units, rush").run()
+        self.assertFalse(at.exception)
+        self.assertTrue(any("No qualified supplier contacts" in str(item.value) for item in at.success))
+
+
+if __name__ == "__main__":
+    unittest.main()
